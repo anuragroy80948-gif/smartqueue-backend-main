@@ -1,0 +1,397 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const nodemailer = require('nodemailer');
+const { createAnalyticsSummary, summaryMetrics } = require('../services/analyticsSummary.service');
+const {
+  buildTokenCreatedMessage,
+  buildTokenCalledMessage,
+  sendTokenCreatedEmail,
+  sendTokenCreatedAdminEmail,
+  sendTokenCalledEmail,
+  sendTokenCreatedSms,
+  sendTokenCalledSms,
+} = require('../services/sms.service');
+const { MAX_ADMINS, isValidAdminRegistrationCode } = require('../services/adminRegistration.service');
+const smtpEnvKeys = ['SMTP_Server', 'Port', 'Login', 'BREVO_SMTP_KEY'];
+
+test('AI summary input contains aggregate analytics only', () => {
+  const analytics = {
+    range: { from: '2026-10-22', to: '2026-10-22' },
+    totals: { total: 12, waiting: 4, completed: 8 },
+    avgWaitMin: 5.5,
+    avgServiceMin: 3,
+    departmentQueues: [{ name: 'Admissions', code: 'AD', waiting: 4 }],
+    hourly: [{ hour: '09:00', tokens: 7 }, { hour: '10:00', tokens: 5 }],
+    users: [{ email: 'private@example.com' }],
+  };
+
+  assert.deepStrictEqual(summaryMetrics(analytics), {
+    range: analytics.range,
+    totals: analytics.totals,
+    averageWaitMinutes: 5.5,
+    averageServiceMinutes: 3,
+    departmentQueues: analytics.departmentQueues,
+    busiestHours: analytics.hourly,
+  });
+});
+
+test('SMS body includes the token, department, and estimated wait', () => {
+  assert.strictEqual(buildTokenCreatedMessage({
+    tokenNumber: 'AD-012',
+    department: { name: 'Admissions' },
+    estimatedWaitLabel: 'about 10 minutes',
+  }), 'SmartQueue: token AD-012 created for Admissions. Estimated wait: about 10 minutes.');
+});
+
+test('call email body includes the token, department, and counter', () => {
+  assert.strictEqual(buildTokenCalledMessage({
+    tokenNumber: 'AD-012',
+    department: { name: 'Admissions' },
+    counter: 'Counter 3',
+  }), 'SmartQueue: token AD-012 for Admissions is called. Please go to Counter 3.');
+});
+
+test('token email is marked unconfigured when no provider credentials are set', async () => {
+  const oldEnv = Object.fromEntries([...smtpEnvKeys, 'BREVO_API_KEY', 'BREVO_SENDER_EMAIL', 'BREVO_SENDER_NAME'].map((key) => [key, process.env[key]]));
+  for (const key of Object.keys(oldEnv)) delete process.env[key];
+  try {
+    assert.strictEqual(await sendTokenCreatedEmail('user@example.com', 'User', {
+      tokenNumber: 'AD-012',
+      department: { name: 'Admissions' },
+      estimatedWaitLabel: 'about 10 minutes',
+    }), null);
+  } finally {
+    for (const [key, value] of Object.entries(oldEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('Brevo SMTP sends queue email with the configured host and login', async () => {
+  const envKeys = [...smtpEnvKeys, 'BREVO_API_KEY', 'BREVO_SENDER_EMAIL', 'BREVO_SENDER_NAME'];
+  const oldEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  const oldCreateTransport = nodemailer.createTransport;
+  let transportConfig;
+  let message;
+  process.env.SMTP_Server = 'smtp-relay.brevo.com';
+  process.env.Port = '587';
+  process.env.Login = 'test-login';
+  process.env.BREVO_SMTP_KEY = 'test-smtp-key';
+  process.env.BREVO_API_KEY = '';
+  process.env.BREVO_SENDER_EMAIL = 'verified@example.com';
+  process.env.BREVO_SENDER_NAME = 'SmartQueue';
+  nodemailer.createTransport = (config) => {
+    transportConfig = config;
+    return { sendMail: async (mail) => { message = mail; } };
+  };
+  try {
+    assert.strictEqual(await sendTokenCreatedEmail('user@example.com', 'User', {
+      tokenNumber: 'AD-012',
+      department: { name: 'Admissions' },
+      estimatedWaitLabel: 'about 10 minutes',
+    }), true);
+    assert.strictEqual(transportConfig.host, 'smtp-relay.brevo.com');
+    assert.strictEqual(transportConfig.port, 587);
+    assert.strictEqual(transportConfig.requireTLS, true);
+    assert.deepStrictEqual(transportConfig.auth, { user: 'test-login', pass: 'test-smtp-key' });
+    assert.deepStrictEqual(message.from, { name: 'SmartQueue', address: 'verified@example.com' });
+    assert.deepStrictEqual(message.to, [{ address: 'user@example.com', name: 'User' }]);
+    assert.strictEqual(message.text, 'SmartQueue: token AD-012 created for Admissions. Estimated wait: about 10 minutes.');
+  } finally {
+    nodemailer.createTransport = oldCreateTransport;
+    for (const [key, value] of Object.entries(oldEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('Brevo API is preferred when both API and SMTP are configured', async () => {
+  const envKeys = [...smtpEnvKeys, 'BREVO_API_KEY', 'BREVO_SENDER_EMAIL', 'BREVO_SENDER_NAME'];
+  const oldEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  const oldFetch = global.fetch;
+  const oldCreateTransport = nodemailer.createTransport;
+  let request;
+  process.env.SMTP_Server = 'smtp-relay.brevo.com';
+  process.env.Port = '587';
+  process.env.Login = 'test-login';
+  process.env.BREVO_SMTP_KEY = 'test-smtp-key';
+  process.env.BREVO_API_KEY = 'test-api-key';
+  process.env.BREVO_SENDER_EMAIL = 'verified@example.com';
+  process.env.BREVO_SENDER_NAME = 'SmartQueue';
+  global.fetch = async (url, options) => {
+    request = { url, options };
+    return { ok: true };
+  };
+  nodemailer.createTransport = () => {
+    assert.fail('SMTP should not be used when the Brevo API is configured');
+  };
+  try {
+    assert.strictEqual(await sendTokenCreatedEmail('user@example.com', 'User', {
+      tokenNumber: 'AD-012',
+      department: { name: 'Admissions' },
+      estimatedWaitLabel: 'about 10 minutes',
+    }), true);
+    assert.strictEqual(request.url, 'https://api.brevo.com/v3/smtp/email');
+    assert.strictEqual(request.options.headers['api-key'], 'test-api-key');
+  } finally {
+    global.fetch = oldFetch;
+    nodemailer.createTransport = oldCreateTransport;
+    for (const [key, value] of Object.entries(oldEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('admin registration requires the configured shared code and is capped at five admins', () => {
+  const oldCode = process.env.ADMIN_REGISTRATION_CODE;
+  process.env.ADMIN_REGISTRATION_CODE = 'private-registration-code';
+  try {
+    assert.strictEqual(MAX_ADMINS, 5);
+    assert.strictEqual(isValidAdminRegistrationCode('private-registration-code'), true);
+    assert.strictEqual(isValidAdminRegistrationCode('wrong-registration-code'), false);
+    assert.strictEqual(isValidAdminRegistrationCode(undefined), false);
+  } finally {
+    if (oldCode === undefined) delete process.env.ADMIN_REGISTRATION_CODE;
+    else process.env.ADMIN_REGISTRATION_CODE = oldCode;
+  }
+});
+
+  test('OpenRouter summary uses server credentials and sends only aggregate metrics', async () => {
+    const oldFetch = global.fetch;
+    const oldKey = process.env.OPENROUTER_API_KEY;
+    const oldModel = process.env.OPENROUTER_MODEL;
+    process.env.OPENROUTER_API_KEY = 'test-api-key';
+    process.env.OPENROUTER_MODEL = 'test-model';
+    let request;
+    global.fetch = async (url, options) => {
+      request = { url, options };
+      return { ok: true, json: async () => ({ choices: [{ message: { content: 'Queue volume is steady.' } }] }) };
+    };
+    try {
+      const result = await createAnalyticsSummary({
+        range: { from: '2026-10-22', to: '2026-10-22' },
+        totals: { total: 0 },
+        avgWaitMin: null,
+        avgServiceMin: null,
+        departmentQueues: [],
+        hourly: [],
+        users: [{ email: 'private@example.com' }],
+      });
+      const body = JSON.parse(request.options.body);
+      assert.strictEqual(result, 'Queue volume is steady.');
+      assert.strictEqual(request.url, 'https://openrouter.ai/api/v1/chat/completions');
+      assert.strictEqual(request.options.headers.authorization, 'Bearer test-api-key');
+      assert.strictEqual(body.model, 'test-model');
+      assert.ok(!request.options.body.includes('private@example.com'));
+    } finally {
+      global.fetch = oldFetch;
+      if (oldKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = oldKey;
+      if (oldModel === undefined) delete process.env.OPENROUTER_MODEL;
+      else process.env.OPENROUTER_MODEL = oldModel;
+    }
+  });
+
+  test('Brevo email uses the configured sender and account email', async () => {
+    const oldFetch = global.fetch;
+    const oldEnv = Object.fromEntries([...smtpEnvKeys, 'BREVO_API_KEY', 'BREVO_SENDER_EMAIL', 'BREVO_SENDER_NAME', 'BREVO_SMS_SENDER'].map((key) => [key, process.env[key]]));
+    for (const key of smtpEnvKeys) delete process.env[key];
+    process.env.BREVO_API_KEY = 'test-api-key';
+    process.env.BREVO_SENDER_EMAIL = 'verified@example.com';
+    process.env.BREVO_SENDER_NAME = 'SmartQueue';
+    let request;
+    global.fetch = async (url, options) => {
+      request = { url, options };
+      return { ok: true };
+    };
+    try {
+      assert.strictEqual(await sendTokenCreatedEmail('user@example.com', 'User', {
+        tokenNumber: 'AD-012',
+        department: { name: '<Admissions>' },
+        estimatedWaitLabel: 'about 10 minutes',
+      }), true);
+      assert.strictEqual(request.url, 'https://api.brevo.com/v3/smtp/email');
+      assert.strictEqual(request.options.headers['api-key'], 'test-api-key');
+      const body = JSON.parse(request.options.body);
+      assert.deepStrictEqual(body.sender, { email: 'verified@example.com', name: 'SmartQueue' });
+      assert.deepStrictEqual(body.to, [{ email: 'user@example.com', name: 'User' }]);
+      assert.ok(body.htmlContent.includes('&lt;Admissions&gt;'));
+    } finally {
+      global.fetch = oldFetch;
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test('token creation email notifies all active admins with user and token details', async () => {
+    const oldFetch = global.fetch;
+    const oldEnv = Object.fromEntries([...smtpEnvKeys, 'BREVO_API_KEY', 'BREVO_SENDER_EMAIL', 'BREVO_SENDER_NAME'].map((key) => [key, process.env[key]]));
+    for (const key of smtpEnvKeys) delete process.env[key];
+    process.env.BREVO_API_KEY = 'test-api-key';
+    process.env.BREVO_SENDER_EMAIL = 'verified@example.com';
+    process.env.BREVO_SENDER_NAME = 'SmartQueue';
+    let request;
+    global.fetch = async (url, options) => {
+      request = { url, options };
+      return { ok: true };
+    };
+    try {
+      assert.strictEqual(await sendTokenCreatedAdminEmail([
+        { email: 'admin@example.com', name: 'Admin' },
+        { email: 'admin2@example.com', name: 'Admin 2' },
+      ], {
+        name: '<User>',
+        email: 'user@example.com',
+      }, {
+        tokenNumber: 'AD-012',
+        department: { name: '<Admissions>' },
+        estimatedWaitLabel: 'about 10 minutes',
+      }), true);
+      assert.strictEqual(request.url, 'https://api.brevo.com/v3/smtp/email');
+      const body = JSON.parse(request.options.body);
+      assert.deepStrictEqual(body.to, [
+        { email: 'admin@example.com', name: 'Admin' },
+        { email: 'admin2@example.com', name: 'Admin 2' },
+      ]);
+      assert.strictEqual(body.subject, 'New SmartQueue token AD-012 created');
+      assert.ok(body.textContent.includes('user@example.com'));
+      assert.ok(body.htmlContent.includes('&lt;User&gt;'));
+      assert.ok(body.htmlContent.includes('&lt;Admissions&gt;'));
+    } finally {
+      global.fetch = oldFetch;
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test('Brevo email rejection includes the provider reason', async () => {
+    const oldFetch = global.fetch;
+    const oldEnv = Object.fromEntries([...smtpEnvKeys, 'BREVO_API_KEY', 'BREVO_SENDER_EMAIL', 'BREVO_SENDER_NAME'].map((key) => [key, process.env[key]]));
+    for (const key of smtpEnvKeys) delete process.env[key];
+    process.env.BREVO_API_KEY = 'test-api-key';
+    process.env.BREVO_SENDER_EMAIL = 'verified@example.com';
+    process.env.BREVO_SENDER_NAME = 'SmartQueue';
+    global.fetch = async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({ message: 'Invalid API key' }),
+    });
+    try {
+      await assert.rejects(
+        sendTokenCreatedEmail('user@example.com', 'User', {
+          tokenNumber: 'AD-012',
+          department: { name: 'Admissions' },
+          estimatedWaitLabel: 'about 10 minutes',
+        }),
+        /Brevo rejected the email request \(HTTP 401\): Invalid API key/,
+      );
+    } finally {
+      global.fetch = oldFetch;
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test('Brevo call email tells the user which counter to visit', async () => {
+    const oldFetch = global.fetch;
+    const oldEnv = Object.fromEntries([...smtpEnvKeys, 'BREVO_API_KEY', 'BREVO_SENDER_EMAIL', 'BREVO_SENDER_NAME'].map((key) => [key, process.env[key]]));
+    for (const key of smtpEnvKeys) delete process.env[key];
+    process.env.BREVO_API_KEY = 'test-api-key';
+    process.env.BREVO_SENDER_EMAIL = 'verified@example.com';
+    process.env.BREVO_SENDER_NAME = 'SmartQueue';
+    let request;
+    global.fetch = async (url, options) => {
+      request = { url, options };
+      return { ok: true };
+    };
+    try {
+      assert.strictEqual(await sendTokenCalledEmail('user@example.com', 'User', {
+        tokenNumber: 'AD-012',
+        department: { name: '<Admissions>' },
+        counter: '<Counter 3>',
+      }), true);
+      assert.strictEqual(request.url, 'https://api.brevo.com/v3/smtp/email');
+      const body = JSON.parse(request.options.body);
+      assert.deepStrictEqual(body.to, [{ email: 'user@example.com', name: 'User' }]);
+      assert.strictEqual(body.subject, 'Your SmartQueue token AD-012 is called');
+      assert.ok(body.htmlContent.includes('&lt;Admissions&gt;'));
+      assert.ok(body.htmlContent.includes('&lt;Counter 3&gt;'));
+    } finally {
+      global.fetch = oldFetch;
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test('Brevo call SMS tells the user which counter to visit', async () => {
+    const oldFetch = global.fetch;
+    const oldEnv = Object.fromEntries(['BREVO_API_KEY', 'BREVO_SMS_SENDER'].map((key) => [key, process.env[key]]));
+    process.env.BREVO_API_KEY = 'test-api-key';
+    process.env.BREVO_SMS_SENDER = 'SmartQ';
+    let request;
+    global.fetch = async (url, options) => {
+      request = { url, options };
+      return { ok: true };
+    };
+    try {
+      assert.strictEqual(await sendTokenCalledSms('+14155552671', {
+        tokenNumber: 'AD-012',
+        department: { name: 'Admissions' },
+        counter: 'Counter 3',
+      }), true);
+      assert.strictEqual(request.url, 'https://api.brevo.com/v3/transactionalSMS/sms');
+      const body = JSON.parse(request.options.body);
+      assert.strictEqual(body.recipient, '+14155552671');
+      assert.strictEqual(body.content, 'SmartQueue: token AD-012 for Admissions is called. Please go to Counter 3.');
+    } finally {
+      global.fetch = oldFetch;
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test('Brevo SMS uses the configured sender and opted-in profile phone', async () => {
+    const oldFetch = global.fetch;
+    const oldEnv = Object.fromEntries(['BREVO_API_KEY', 'BREVO_SMS_SENDER'].map((key) => [key, process.env[key]]));
+    process.env.BREVO_API_KEY = 'test-api-key';
+    process.env.BREVO_SMS_SENDER = 'SmartQ';
+    let request;
+    global.fetch = async (url, options) => {
+      request = { url, options };
+      return { ok: true };
+    };
+    try {
+      assert.strictEqual(await sendTokenCreatedSms('+14155552671', {
+        tokenNumber: 'AD-012',
+        department: { name: 'Admissions' },
+        estimatedWaitLabel: 'about 10 minutes',
+      }), true);
+      assert.strictEqual(request.url, 'https://api.brevo.com/v3/transactionalSMS/sms');
+      assert.strictEqual(request.options.headers['api-key'], 'test-api-key');
+      assert.deepStrictEqual(JSON.parse(request.options.body), {
+        sender: 'SmartQ',
+        recipient: '+14155552671',
+        content: 'SmartQueue: token AD-012 created for Admissions. Estimated wait: about 10 minutes.',
+        type: 'transactional',
+      });
+    } finally {
+      global.fetch = oldFetch;
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
